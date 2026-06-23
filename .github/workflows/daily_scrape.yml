@@ -147,7 +147,7 @@ jobs:
           print(f"After remote filter: {len(remote_hits)} | After 24h posted filter (no reposts): {len(fresh_hits)}")
 
           creds = Credentials.from_service_account_info(
-              json.loads(GOOGLE_CREDS_JSON),
+              json.loads(GOOGLE_CREDS_JSON.strip()),
               scopes=["https://www.googleapis.com/auth/spreadsheets"],
           )
           gc = gspread.authorize(creds)
@@ -161,6 +161,10 @@ jobs:
           existing_ids = set(ws.col_values(1)[1:])
           new_hits = [h for h in fresh_hits if str(h.get("id") or h.get("linkedin_id") or "") not in existing_ids]
           print(f"Existing in sheet: {len(existing_ids)} | New to add: {len(new_hits)}")
+
+          if not fresh_hits and not existing_ids:
+              print("Rate limited with 0 jobs fetched — try again in an hour.")
+              exit(0)
 
           if not new_hits:
               print("No new jobs. Done.")
