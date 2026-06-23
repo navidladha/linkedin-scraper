@@ -68,6 +68,9 @@ jobs:
                           "description": SEARCH_DESCRIPTION,
                       }
                       resp = client.get(RAPIDAPI_URL, headers=headers, params=params)
+                      if resp.status_code == 429:
+                          print(f"Rate limited at offset {offset}, stopping pagination with {len(all_hits)} jobs.")
+                          break
                       resp.raise_for_status()
                       batch = resp.json()
                       if not batch or not isinstance(batch, list):
@@ -76,7 +79,7 @@ jobs:
                       if len(batch) < limit:
                           break
                       offset += limit
-                      time.sleep(0.5)
+                      time.sleep(2)
               print(f"Fetched {len(all_hits)} raw jobs from LinkedIn API.")
               return all_hits
 
