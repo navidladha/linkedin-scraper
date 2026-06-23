@@ -1,8 +1,6 @@
 name: Daily LinkedIn Scrape
 
 on:
-  schedule:
-    - cron: "0 9 * * *"
   workflow_dispatch:
 
 jobs:
@@ -38,7 +36,7 @@ jobs:
           RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/active-jb"
 
           SEARCH_DESCRIPTION = "nonprofit"
-          MAX_JOBS = 200
+          MAX_JOBS = 1000
 
           SHEET_COLUMNS = [
               "id", "title", "company", "company_website", "company_industry",
@@ -57,7 +55,7 @@ jobs:
               }
               all_hits = []
               offset = 0
-              limit = 10
+              limit = 1000
               with httpx.Client(timeout=30) as client:
                   while len(all_hits) < MAX_JOBS:
                       params = {
@@ -85,6 +83,20 @@ jobs:
 
           def is_remote(hit):
               return (hit.get("location_type") or "").upper() == "TELECOMMUTE"
+
+          def meets_salary(hit):
+              salary = hit.get("salary")
+              if not salary or not isinstance(salary, dict):
+                  return True
+              s_max = salary.get("maximum") or 0
+              s_min = salary.get("minimum") or 0
+              best = max(float(s_max or 0), float(s_min or 0))
+              period = (salary.get("period") or "").upper()
+              if period == "HOUR":
+                  best = best * 2080
+              elif period == "MONTH":
+                  best = best * 12
+              return best == 0 or best >= 80000
 
           def is_fresh(hit):
               date_posted = hit.get("date_posted") or ""
@@ -144,7 +156,8 @@ jobs:
 
           remote_hits = [h for h in hits if is_remote(h)]
           fresh_hits = [h for h in remote_hits if is_fresh(h)]
-          print(f"After remote filter: {len(remote_hits)} | After 24h posted filter (no reposts): {len(fresh_hits)}")
+          salary_hits = [h for h in fresh_hits if meets_salary(h)]
+          print(f"After remote filter: {len(remote_hits)} | After 24h filter: {len(fresh_hits)} | After salary filter: {len(salary_hits)}")
 
           if not hits:
               print("Rate limited or no results — skipping sheet update.")
@@ -164,7 +177,7 @@ jobs:
               ws.append_row(SHEET_COLUMNS)
 
           existing_ids = set(ws.col_values(1)[1:])
-          new_hits = [h for h in fresh_hits if str(h.get("id") or h.get("linkedin_id") or "") not in existing_ids]
+          new_hits = [h for h in salary_hits if str(h.get("id") or h.get("linkedin_id") or "") not in existing_ids]
           print(f"Existing in sheet: {len(existing_ids)} | New to add: {len(new_hits)}")
 
           if not new_hits:
