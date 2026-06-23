@@ -1,0 +1,173 @@
+name: Daily LinkedIn Scrape
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install httpx==0.27.0 gspread==6.1.2 google-auth==2.29.0
+
+      - name: Run scraper
+        env:
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          python3 << 'EOF'
+          import json, os, time, httpx, gspread
+          from datetime import datetime, timezone, timedelta
+          from google.oauth2.service_account import Credentials
+
+          RAPIDAPI_KEY = os.environ["RAPIDAPI_KEY"]
+          GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
+          GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
+
+          RAPIDAPI_HOST = "linkedin-job-search-api.p.rapidapi.com"
+          RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/active-jb"
+
+          SEARCH_DESCRIPTION = "nonprofit"
+          MAX_JOBS = 200
+
+          SHEET_COLUMNS = [
+              "id", "title", "company", "company_website", "company_industry",
+              "location", "location_type", "seniority", "employment_type",
+              "salary", "direct_apply", "apply_url", "posted_at", "source_platform", "scraped_at",
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def fetch_jobs():
+              headers = {
+                  "x-rapidapi-host": RAPIDAPI_HOST,
+                  "x-rapidapi-key": RAPIDAPI_KEY,
+                  "Content-Type": "application/json",
+              }
+              all_hits = []
+              offset = 0
+              limit = 10
+              with httpx.Client(timeout=30) as client:
+                  while len(all_hits) < MAX_JOBS:
+                      params = {
+                          "time_frame": "24h",
+                          "limit": limit,
+                          "offset": offset,
+                          "description_format": "text",
+                          "description": SEARCH_DESCRIPTION,
+                      }
+                      resp = client.get(RAPIDAPI_URL, headers=headers, params=params)
+                      resp.raise_for_status()
+                      batch = resp.json()
+                      if not batch or not isinstance(batch, list):
+                          break
+                      all_hits.extend(batch)
+                      if len(batch) < limit:
+                          break
+                      offset += limit
+                      time.sleep(0.5)
+              print(f"Fetched {len(all_hits)} raw jobs from LinkedIn API.")
+              return all_hits
+
+          def is_remote(hit):
+              return (hit.get("location_type") or "").upper() == "TELECOMMUTE"
+
+          def is_fresh(hit):
+              date_posted = hit.get("date_posted") or ""
+              if not date_posted:
+                  return False
+              try:
+                  posted = datetime.fromisoformat(date_posted.replace("Z", "+00:00"))
+                  if posted.tzinfo is None:
+                      posted = posted.replace(tzinfo=timezone.utc)
+                  cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+                  return posted >= cutoff
+              except Exception:
+                  return False
+
+          def parse_salary(salary):
+              if not isinstance(salary, dict):
+                  return ""
+              s_min = salary.get("minimum") or ""
+              s_max = salary.get("maximum") or ""
+              s_cur = salary.get("currency") or ""
+              s_per = (salary.get("period") or "").lower()
+              def fmt(n):
+                  try:
+                      n = float(n)
+                      return f"${int(n)//1000}k" if n >= 1000 else f"${int(n)}"
+                  except: return str(n)
+              if s_min and s_max:
+                  return f"{fmt(s_min)} - {fmt(s_max)} {s_cur}/{s_per}".strip()
+              elif s_min or s_max:
+                  return fmt(s_min or s_max)
+              return ""
+
+          def parse_job(hit, scraped_at):
+              location = (hit.get("locations_derived") or [""])[0]
+              emp_types = hit.get("employment_type") or []
+              employment_type = ", ".join(t.replace("_", " ").title() for t in emp_types)
+              return {
+                  "id": str(hit.get("id") or hit.get("linkedin_id") or ""),
+                  "title": hit.get("title") or "",
+                  "company": hit.get("organization") or "",
+                  "company_website": hit.get("org_linkedin_website") or hit.get("organization_url") or "",
+                  "company_industry": hit.get("org_linkedin_industry") or "",
+                  "location": location,
+                  "location_type": "remote",
+                  "seniority": hit.get("seniority") or "",
+                  "employment_type": employment_type,
+                  "salary": parse_salary(hit.get("salary")),
+                  "direct_apply": "Yes" if hit.get("direct_apply") else "No",
+                  "apply_url": hit.get("url") or "",
+                  "posted_at": hit.get("date_posted") or "",
+                  "source_platform": "linkedin.com",
+                  "scraped_at": scraped_at,
+              }
+
+          print(f"[{now_iso()}] Starting LinkedIn scrape...")
+          hits = fetch_jobs()
+
+          remote_hits = [h for h in hits if is_remote(h)]
+          fresh_hits = [h for h in remote_hits if is_fresh(h)]
+          print(f"After remote filter: {len(remote_hits)} | After 24h posted filter (no reposts): {len(fresh_hits)}")
+
+          creds = Credentials.from_service_account_info(
+              json.loads(GOOGLE_CREDS_JSON),
+              scopes=["https://www.googleapis.com/auth/spreadsheets"],
+          )
+          gc = gspread.authorize(creds)
+          sh = gc.open_by_key(GOOGLE_SHEET_ID)
+          try:
+              ws = sh.worksheet("LinkedIn Jobs")
+          except gspread.WorksheetNotFound:
+              ws = sh.add_worksheet("LinkedIn Jobs", rows=10000, cols=len(SHEET_COLUMNS))
+              ws.append_row(SHEET_COLUMNS)
+
+          existing_ids = set(ws.col_values(1)[1:])
+          new_hits = [h for h in fresh_hits if str(h.get("id") or h.get("linkedin_id") or "") not in existing_ids]
+          print(f"Existing in sheet: {len(existing_ids)} | New to add: {len(new_hits)}")
+
+          if not new_hits:
+              print("No new jobs. Done.")
+          else:
+              scraped_at = now_iso()
+              new_rows = []
+              for hit in new_hits:
+                  job = parse_job(hit, scraped_at)
+                  new_rows.append([job.get(col, "") for col in SHEET_COLUMNS])
+              ws.append_rows(new_rows, value_input_option="RAW")
+              print(f"Added {len(new_rows)} new jobs.")
+          print("Done.")
+          EOF
