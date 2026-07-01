@@ -1,4 +1,4 @@
-name: Daily LinkedIn Scrape
+name: LinkedIn Nonprofit Scrape
 
 on:
   workflow_dispatch:
@@ -32,16 +32,15 @@ jobs:
           GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
           GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
-          RAPIDAPI_HOST = "linkedin-job-search-api.p.rapidapi.com"
-          RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/active-jb"
+          RAPIDAPI_HOST = "linkedin-scraper-api-real-time-fast-affordable.p.rapidapi.com"
+          RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/jobs/search"
 
-          SEARCH_DESCRIPTION = "nonprofit"
-          MAX_JOBS = 1000
+          MIN_SALARY = 80000
 
           SHEET_COLUMNS = [
-              "id", "title", "company", "company_website", "company_industry",
-              "location", "location_type", "seniority", "employment_type",
-              "salary", "direct_apply", "apply_url", "posted_at", "source_platform", "scraped_at",
+              "id", "title", "company", "company_url", "location", "work_type",
+              "salary", "skills", "benefits", "applicant_count",
+              "apply_url", "posted_at", "source_platform", "scraped_at",
           ]
 
           def now_iso():
@@ -53,119 +52,85 @@ jobs:
                   "x-rapidapi-key": RAPIDAPI_KEY,
                   "Content-Type": "application/json",
               }
-              all_hits = []
-              offset = 0
-              limit = 1000
-              with httpx.Client(timeout=30) as client:
-                  while len(all_hits) < MAX_JOBS:
-                      params = {
-                          "time_frame": "24h",
-                          "limit": limit,
-                          "offset": offset,
-                          "description_format": "text",
-                          "description": SEARCH_DESCRIPTION,
-                      }
-                      resp = client.get(RAPIDAPI_URL, headers=headers, params=params)
-                      if resp.status_code == 429:
-                          print(f"Rate limited at offset {offset}, stopping pagination with {len(all_hits)} jobs.")
-                          break
-                      resp.raise_for_status()
-                      batch = resp.json()
-                      if not batch or not isinstance(batch, list):
-                          break
-                      all_hits.extend(batch)
-                      if len(batch) < limit:
-                          break
-                      offset += limit
-                      time.sleep(2)
-              print(f"Fetched {len(all_hits)} raw jobs from LinkedIn API.")
-              return all_hits
+              params = {
+                  "keywords": "nonprofit",
+                  "location": "United States",
+                  "work_type": "Remote",
+                  "page_number": "1",
+              }
+              resp = httpx.get(RAPIDAPI_URL, headers=headers, params=params, timeout=30)
+              if resp.status_code == 429:
+                  print("Rate limited — try again later.")
+                  return []
+              resp.raise_for_status()
+              data = resp.json()
+              jobs = data.get("data", {}).get("jobs", [])
+              total = data.get("data", {}).get("metadata", {}).get("total_jobs", 0)
+              print(f"Fetched {len(jobs)} jobs (of {total} total remote nonprofit jobs).")
+              return jobs
 
-          def is_remote(hit):
-              return (hit.get("location_type") or "").upper() == "TELECOMMUTE"
-
-          def meets_salary(hit):
-              salary = hit.get("salary")
-              if not salary or not isinstance(salary, dict):
-                  return True
-              s_max = salary.get("maximum") or 0
-              s_min = salary.get("minimum") or 0
-              best = max(float(s_max or 0), float(s_min or 0))
-              period = (salary.get("period") or "").upper()
-              if period == "HOUR":
-                  best = best * 2080
-              elif period == "MONTH":
-                  best = best * 12
-              return best == 0 or best >= 80000
-
-          def is_fresh(hit):
-              date_posted = hit.get("date_posted") or ""
-              if not date_posted:
+          def is_fresh(job):
+              posted = job.get("posted_at") or ""
+              if not posted:
                   return False
               try:
-                  posted = datetime.fromisoformat(date_posted.replace("Z", "+00:00"))
-                  if posted.tzinfo is None:
-                      posted = posted.replace(tzinfo=timezone.utc)
-                  cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-                  return posted >= cutoff
+                  dt = datetime.fromisoformat(posted.replace("Z", "+00:00"))
+                  if dt.tzinfo is None:
+                      dt = dt.replace(tzinfo=timezone.utc)
+                  return dt >= datetime.now(timezone.utc) - timedelta(hours=24)
               except Exception:
                   return False
 
-          def parse_salary(salary):
-              if not isinstance(salary, dict):
-                  return ""
-              s_min = salary.get("minimum") or ""
-              s_max = salary.get("maximum") or ""
-              s_cur = salary.get("currency") or ""
-              s_per = (salary.get("period") or "").lower()
-              def fmt(n):
-                  try:
-                      n = float(n)
-                      return f"${int(n)//1000}k" if n >= 1000 else f"${int(n)}"
-                  except: return str(n)
-              if s_min and s_max:
-                  return f"{fmt(s_min)} - {fmt(s_max)} {s_cur}/{s_per}".strip()
-              elif s_min or s_max:
-                  return fmt(s_min or s_max)
-              return ""
+          def meets_salary(job):
+              salary = job.get("salary") or ""
+              if not salary:
+                  return True
+              try:
+                  import re
+                  nums = re.findall(r'[\d,]+', salary.replace(",", ""))
+                  if not nums:
+                      return True
+                  max_val = max(int(n.replace(",", "")) for n in nums)
+                  if "k" in salary.lower():
+                      max_val *= 1000
+                  if "/hr" in salary.lower() or "hour" in salary.lower():
+                      max_val *= 2080
+                  return max_val >= MIN_SALARY
+              except Exception:
+                  return True
 
-          def parse_job(hit, scraped_at):
-              location = (hit.get("locations_derived") or [""])[0]
-              emp_types = hit.get("employment_type") or []
-              employment_type = ", ".join(t.replace("_", " ").title() for t in emp_types)
+          def parse_job(job, scraped_at):
               return {
-                  "id": str(hit.get("id") or hit.get("linkedin_id") or ""),
-                  "title": hit.get("title") or "",
-                  "company": hit.get("organization") or "",
-                  "company_website": hit.get("org_linkedin_website") or hit.get("organization_url") or "",
-                  "company_industry": hit.get("org_linkedin_industry") or "",
-                  "location": location,
-                  "location_type": "remote",
-                  "seniority": hit.get("seniority") or "",
-                  "employment_type": employment_type,
-                  "salary": parse_salary(hit.get("salary")),
-                  "direct_apply": "Yes" if hit.get("direct_apply") else "No",
-                  "apply_url": hit.get("url") or "",
-                  "posted_at": hit.get("date_posted") or "",
+                  "id": str(job.get("job_id") or ""),
+                  "title": job.get("job_title") or "",
+                  "company": job.get("company") or "",
+                  "company_url": job.get("company_url") or "",
+                  "location": job.get("location") or "",
+                  "work_type": job.get("work_type") or "",
+                  "salary": job.get("salary") or "",
+                  "skills": ", ".join(job.get("skills") or []),
+                  "benefits": ", ".join(job.get("benefits") or []),
+                  "applicant_count": job.get("applicant_count") or "",
+                  "apply_url": job.get("job_url") or "",
+                  "posted_at": job.get("posted_at") or "",
                   "source_platform": "linkedin.com",
                   "scraped_at": scraped_at,
               }
 
           print(f"[{now_iso()}] Starting LinkedIn scrape...")
-          hits = fetch_jobs()
+          jobs = fetch_jobs()
 
-          remote_hits = [h for h in hits if is_remote(h)]
-          fresh_hits = [h for h in remote_hits if is_fresh(h)]
-          salary_hits = [h for h in fresh_hits if meets_salary(h)]
-          print(f"After remote filter: {len(remote_hits)} | After 24h filter: {len(fresh_hits)} | After salary filter: {len(salary_hits)}")
-
-          if not hits:
-              print("Rate limited or no results — skipping sheet update.")
+          if not jobs:
+              print("No jobs fetched — exiting.")
               exit(0)
 
-          creds_raw = GOOGLE_CREDS_JSON.strip().strip("'\"")
+          fresh = [j for j in jobs if is_fresh(j)]
+          no_easy = [j for j in fresh if not j.get("is_easy_apply")]
+          salaried = [j for j in no_easy if meets_salary(j)]
+          print(f"After 24h filter: {len(fresh)} | After removing easy apply: {len(no_easy)} | After salary filter: {len(salaried)}")
+
           creds = Credentials.from_service_account_info(
-              json.loads(creds_raw),
+              json.loads(GOOGLE_CREDS_JSON.strip()),
               scopes=["https://www.googleapis.com/auth/spreadsheets"],
           )
           gc = gspread.authorize(creds)
@@ -177,18 +142,15 @@ jobs:
               ws.append_row(SHEET_COLUMNS)
 
           existing_ids = set(ws.col_values(1)[1:])
-          new_hits = [h for h in salary_hits if str(h.get("id") or h.get("linkedin_id") or "") not in existing_ids]
-          print(f"Existing in sheet: {len(existing_ids)} | New to add: {len(new_hits)}")
+          new_jobs = [j for j in salaried if str(j.get("job_id") or "") not in existing_ids]
+          print(f"Existing in sheet: {len(existing_ids)} | New to add: {len(new_jobs)}")
 
-          if not new_hits:
+          if not new_jobs:
               print("No new jobs. Done.")
           else:
               scraped_at = now_iso()
-              new_rows = []
-              for hit in new_hits:
-                  job = parse_job(hit, scraped_at)
-                  new_rows.append([job.get(col, "") for col in SHEET_COLUMNS])
-              ws.append_rows(new_rows, value_input_option="RAW")
-              print(f"Added {len(new_rows)} new jobs.")
+              rows = [parse_job(j, scraped_at) for j in new_jobs]
+              ws.append_rows([[r.get(col, "") for col in SHEET_COLUMNS] for r in rows], value_input_option="RAW")
+              print(f"Added {len(rows)} new jobs.")
           print("Done.")
           EOF
